@@ -4,7 +4,7 @@ Send and receive files between a Mac running Relay and a phone, tablet, or compu
 
 ## Get Relay
 
-[Download Relay](https://github.com/kunal70006/relay/releases/latest) for Apple silicon Macs running macOS 14 or later.
+[Download the universal build](https://github.com/kunal70006/relay/releases/latest) for Intel and Apple silicon Macs running macOS 14 or later.
 
 ## Transfer files
 

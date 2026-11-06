@@ -2,14 +2,17 @@
 set -euo pipefail
 task_root="${0:A:h}"
 app_bundle="${1:-${task_root:h}/Relay.app}"
-icon_dir=$(mktemp -d "${TMPDIR:-/tmp}/relay-icon.XXXXXX")
-trap 'rm -rf -- "$icon_dir"' EXIT
+build_dir=$(mktemp -d "${TMPDIR:-/tmp}/relay-build.XXXXXX")
+trap 'rm -rf -- "$build_dir"' EXIT
 mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
-xcrun swift "$task_root/Tools/MakeIcon.swift" "$icon_dir/Relay.iconset"
-iconutil --convert icns "$icon_dir/Relay.iconset" --output "$app_bundle/Contents/Resources/Relay.icns"
-xcrun swiftc -swift-version 5 -O -parse-as-library -target arm64-apple-macosx14.0 \
-  "$task_root/Sources/TransferModel.swift" "$task_root/Sources/LocalTransfer.swift" "$task_root/Sources/RelayApp.swift" "$task_root/Sources/Verify.swift" \
-  -o "$app_bundle/Contents/MacOS/Relay"
+xcrun swift "$task_root/Tools/MakeIcon.swift" "$build_dir/Relay.iconset"
+iconutil --convert icns "$build_dir/Relay.iconset" --output "$app_bundle/Contents/Resources/Relay.icns"
+for arch in arm64 x86_64; do
+  xcrun swiftc -swift-version 5 -O -parse-as-library -target "${arch}-apple-macosx14.0" \
+    "$task_root/Sources/TransferModel.swift" "$task_root/Sources/LocalTransfer.swift" "$task_root/Sources/RelayApp.swift" "$task_root/Sources/Verify.swift" \
+    -o "$build_dir/Relay-$arch"
+done
+xcrun lipo -create "$build_dir/Relay-arm64" "$build_dir/Relay-x86_64" -output "$app_bundle/Contents/MacOS/Relay"
 cat > "$app_bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
