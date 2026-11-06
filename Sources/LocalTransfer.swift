@@ -43,7 +43,7 @@ final class LocalTransferModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        panel.message = "Files uploaded from your iPhone will be saved here. Existing files are never overwritten."
+        panel.message = "Relay saves uploads here and keeps existing files."
         panel.prompt = "Receive files here"
         if panel.runModal() == .OK, let folder = panel.url {
             if hasFolderScope, let previous = receiveFolder { previous.stopAccessingSecurityScopedResource() }
@@ -56,7 +56,7 @@ final class LocalTransferModel: ObservableObject {
         guard !running else { return }
         do {
             guard let ip = Self.wifiAddress() else {
-                throw LocalTransferError.message("No Wi-Fi IPv4 address found. Connect this Mac and your iPhone to the same Wi-Fi.")
+                throw LocalTransferError.message("No Wi-Fi IPv4 address found. Connect this Mac and the other device to the same Wi-Fi.")
             }
             guard let pageURL = Bundle.main.url(forResource: "local", withExtension: "html"),
                   let page = try? Data(contentsOf: pageURL) else {

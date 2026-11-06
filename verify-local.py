@@ -2,7 +2,8 @@
 """Check a running Relay session using generated files only.
 
 Usage: python3 verify-local.py SESSION_URL RECEIVING_FOLDER STREAMING_TEST_FILE
-The receiving folder must be a disposable test folder selected in the app.
+Start a session with a generated 32 MB file and a disposable receiving folder.
+Pass the absolute paths to the receiving folder and shared file.
 """
 import hashlib
 import json
@@ -64,9 +65,9 @@ except urllib.error.HTTPError as error:
     passed(error.code == 404, "A wrong session token is rejected")
 
 upload_headers = {"Origin": origin, "X-Relay-Upload": "1", "Content-Type": "application/octet-stream"}
-filename = "phone-verification-✓.txt"
+filename = "upload-verification-✓.txt"
 route = "/upload?name=" + urllib.parse.quote(filename)
-payload = b"Generated phone upload verification\n"
+payload = b"Generated upload verification\n"
 code, _, result = request(route, data=payload, headers=upload_headers)
 saved = json.loads(result)["savedAs"]
 passed(code == 200 and (destination / saved).read_bytes() == payload, "Uploads save exact bytes to the chosen folder")
@@ -85,4 +86,4 @@ with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as conn
     connection.sendall(header.encode() + b"unfinished")
 time.sleep(0.3)
 passed(set(destination.glob(".relay-*.part")) == before and not (destination / "interrupted.txt").exists(), "Interrupted uploads leave no partial files")
-print("Local HTTP verification complete. A physical iPhone still needs a same-Wi-Fi check.")
+print("Local HTTP verification complete. Use another device on the same Wi-Fi to test connectivity.")

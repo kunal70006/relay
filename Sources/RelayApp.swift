@@ -143,10 +143,10 @@ struct ContentView: View {
                     Image(nsImage: qr).interpolation(.none).resizable().scaledToFit()
                         .frame(width: 134, height: 134).padding(10)
                         .background(.white, in: RoundedRectangle(cornerRadius: 10))
-                        .accessibilityLabel("Scan this QR code with your iPhone camera")
+                        .accessibilityLabel("Session QR code")
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Scan with your iPhone").font(.headline)
+                    Text("Open on another device").font(.headline)
                     Text(url.absoluteString).font(.caption.monospaced())
                         .textSelection(.enabled)
                     Button("Copy session link") {

@@ -20,12 +20,12 @@ cat > "$app_bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Relay</string>
 <key>CFBundleIconFile</key><string>Relay.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.6</string>
-<key>CFBundleVersion</key><string>6</string>
+<key>CFBundleShortVersionString</key><string>0.6.1</string>
+<key>CFBundleVersion</key><string>7</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
-<key>NSLocalNetworkUsageDescription</key><string>Relay shares only selected files with your iPhone over the same local Wi-Fi during a session you start.</string>
+<key>NSLocalNetworkUsageDescription</key><string>Relay sends and receives files with devices on your Wi-Fi during a session you start.</string>
 </dict></plist>
 PLIST
 cp "$task_root/Resources/local.html" "$app_bundle/Contents/Resources/local.html"
