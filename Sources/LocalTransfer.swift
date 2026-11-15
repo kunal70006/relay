@@ -667,7 +667,7 @@ private final class HTTPConnection {
                   let rawTotal = query.first(where: { $0.name == "total" })?.value, let fileSize = Int(rawTotal),
                   let rawOffset = query.first(where: { $0.name == "offset" })?.value, let start = Int(rawOffset),
                   fileSize >= 0, fileSize <= maxFileSize, start >= 0, start <= fileSize,
-                  length <= min(8 * 1024 * 1024, fileSize - start), length > 0 || fileSize == 0 else {
+                  length <= fileSize - start, length > 0 || fileSize == 0 else {
                 reply(400, "Invalid upload range")
                 return
             }
@@ -748,20 +748,24 @@ private final class HTTPConnection {
         do {
             try handle.write(contentsOf: data)
             receivedBytes += data.count
-            upload.meter.advance(to: upload.offset + receivedBytes)
-            guard receivedBytes == expectedBytes else { return }
-
-            let nextOffset = upload.offset + receivedBytes
+            // Only record bytes after a successful write. Leave the final write
+            // uncommitted if moving the file into place fails.
+            let nextOffset = upload.offset + data.count
             if nextOffset == upload.total, let temp = upload.temporaryFile {
                 let name = try finishUpload(temp, in: folder, named: upload.name)
                 upload.temporaryFile = nil
                 upload.savedAs = name
+            }
+            upload.offset = nextOffset
+            upload.meter.advance(to: nextOffset)
+            guard receivedBytes == expectedBytes else { return }
+
+            if let name = upload.savedAs {
                 upload.meter.finish(.complete)
                 server.onActivity?(.received(name))
             } else {
                 upload.meter.waitingForChunk = true
             }
-            upload.offset = nextOffset
             upload.active = false
             upload.lastUsed = .now
             try? handle.close()

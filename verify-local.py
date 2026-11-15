@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 base = sys.argv[1].rstrip("/")
 destination = pathlib.Path(sys.argv[2])
@@ -86,4 +87,34 @@ with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as conn
     connection.sendall(header.encode() + b"unfinished")
 time.sleep(0.3)
 passed(set(destination.glob(".relay-*.part")) == before and not (destination / "interrupted.txt").exists(), "Interrupted uploads leave no partial files")
+
+upload_id = str(uuid.uuid4())
+resume_payload = hashlib.shake_256(b"Relay resumable upload").digest(10 * 1024 * 1024 + 7)
+break_at = 127_003
+status_route = f"/upload?id={upload_id}"
+resume_route = f"{status_route}&name=resume-verification.bin&total={len(resume_payload)}"
+with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
+    header = (
+        f"POST {parsed.path}{resume_route}&offset=0 HTTP/1.1\r\n"
+        f"Host: {parsed.netloc}\r\nOrigin: {origin}\r\nX-Relay-Upload: 1\r\n"
+        f"Content-Length: {len(resume_payload)}\r\n\r\n"
+    )
+    connection.sendall(header.encode() + resume_payload[:break_at])
+
+deadline = time.monotonic() + 5
+while True:
+    code, _, data = request(status_route, headers={"X-Relay-Upload": "1"})
+    state = json.loads(data)
+    if code == 200 and state.get("offset") == break_at and not state.get("busy"):
+        break
+    if time.monotonic() >= deadline:
+        raise AssertionError("Relay did not preserve the written bytes after disconnecting")
+    time.sleep(0.05)
+
+code, _, data = request(resume_route + f"&offset={break_at}", data=resume_payload[break_at:], headers=upload_headers)
+state = json.loads(data)
+passed(
+    code == 200 and state["offset"] == len(resume_payload) and (destination / state["savedAs"]).read_bytes() == resume_payload,
+    "A request larger than 8 MiB resumes at the exact saved byte and writes the original contents",
+)
 print("Local HTTP verification complete. Use another device on the same Wi-Fi to test connectivity.")

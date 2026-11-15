@@ -315,7 +315,6 @@ const uploadInput = document.getElementById('upload');
 const retryButton = document.getElementById('retry');
 const progressBar = document.getElementById('progress');
 const uploadStats = document.getElementById('upload-stats');
-const uploadChunkSize = 8 * 1024 * 1024;
 const uploadLimit = 20 * 1024 * 1024 * 1024;
 let pendingUploads = [];
 let uploading = false;
@@ -333,13 +332,58 @@ class UploadError extends Error {
  }
 }
 
-function uploadRequest(query, body, onProgress) {
+function uploadRequest(query, body, onProgress, onWaiting) {
  return new Promise((resolve, reject) => {
   const xhr = new XMLHttpRequest();
   let timer;
-  const touch = () => {
+  let checkTimer;
+  let check;
+  let lastActivity;
+  let serverOffset = query.offset;
+  let finished = false;
+  const scheduleCheck = () => {
+   if (onWaiting && !check && !finished) checkTimer = setTimeout(checkUpload, 4000);
+  };
+  const checkUpload = async () => {
+   const controller = check = new AbortController();
+   const deadline = setTimeout(() => controller.abort(), 3000);
+   onWaiting();
+   try {
+    const response = await fetch(base + '/upload?id=' + encodeURIComponent(query.id), {
+     headers: {'X-Relay-Upload': '1'}, cache: 'no-store', signal: controller.signal
+    });
+    if (!response.ok) return;
+    const state = await response.json();
+    if (finished) return;
+    if (state.savedAs && state.offset === query.total) {
+     resolve(state);
+     xhr.abort();
+    } else if (state.busy && state.offset > serverOffset && state.offset <= query.total) {
+     serverOffset = state.offset;
+     touch();
+    } else if (!state.busy && performance.now() - lastActivity >= 10000) {
+     xhr.abort();
+    }
+   } catch {
+    // The original request can still finish when the status check fails.
+   } finally {
+    clearTimeout(deadline);
+    check = undefined;
+    scheduleCheck();
+   }
+  };
+  const cleanup = () => {
+   finished = true;
    clearTimeout(timer);
+   clearTimeout(checkTimer);
+   check?.abort();
+  };
+  const touch = () => {
+   lastActivity = performance.now();
+   clearTimeout(timer);
+   clearTimeout(checkTimer);
    timer = setTimeout(() => xhr.abort(), 45000);
+   scheduleCheck();
   };
   const parameters = Object.entries(query).map(([key, value]) => encodeURIComponent(key) + '=' + encodeURIComponent(value)).join('&');
   xhr.open(body === undefined ? 'GET' : 'POST', base + '/upload?' + parameters);
@@ -351,7 +395,7 @@ function uploadRequest(query, body, onProgress) {
   };
   xhr.upload.onload = touch;
   xhr.onprogress = touch;
-  xhr.onloadend = () => clearTimeout(timer);
+  xhr.onloadend = cleanup;
   xhr.onload = () => {
    if (xhr.status !== 200) {
     const message = xhr.status === 404 ? 'This session ended. Open the current link from Relay.' : xhr.responseText;
@@ -364,7 +408,7 @@ function uploadRequest(query, body, onProgress) {
   xhr.onerror = xhr.onabort = () => reject(new UploadError('Connection lost. Reconnect to Wi-Fi and retry.', true));
   touch();
   try { xhr.send(body); }
-  catch (error) { clearTimeout(timer); reject(error); }
+  catch (error) { cleanup(); reject(error); }
  });
 }
 
@@ -387,6 +431,7 @@ async function uploadFile(job) {
  let lastTime = started;
  let lastBytes = 0;
  let initialOffset = 0;
+ let highestOffset = 0;
  let firstRequest = true;
  let reconnecting = false;
  const update = bytes => {
@@ -418,27 +463,31 @@ async function uploadFile(job) {
      const state = await uploadRequest({id});
      offset = checkedOffset(state, file.size);
      initialOffset = firstRequest ? offset : Math.min(initialOffset, offset);
+     if (offset > highestOffset) {
+      highestOffset = offset;
+      failures = 0;
+     }
      reset(offset);
-     if (state.savedAs) return complete(state.savedAs);
-     recover = false;
+     if (state.savedAs && offset === file.size) return complete(state.savedAs);
     }
     reconnecting = false;
-    const end = Math.min(offset + uploadChunkSize, file.size);
-    status.textContent = `Sending ${file.name}…`;
+    const sendingMessage = `Sending ${file.name}…`;
+    status.textContent = sendingMessage;
     update(offset);
     job.started = true;
     firstRequest = false;
     const result = await uploadRequest(
      {name: file.name, id, total: file.size, offset},
-     file.slice(offset, end),
-     bytes => update(Math.min(end, offset + bytes))
+     offset === 0 ? file : file.slice(offset),
+     bytes => {
+      if (status.textContent !== sendingMessage) status.textContent = sendingMessage;
+      update(Math.min(file.size, offset + bytes));
+     },
+     () => { status.textContent = 'Waiting for the Mac to confirm…'; }
     );
     const next = checkedOffset(result, file.size);
-    if (result.savedAs) return complete(result.savedAs);
-    if (next === offset) throw new UploadError('The upload did not advance.', true);
-    offset = next;
-    update(offset);
-    failures = 0;
+    if (result.savedAs && next === file.size) return complete(result.savedAs);
+    throw new UploadError('The upload was interrupted before the file was saved.', true);
    } catch (error) {
     reconnecting = true;
     reset(offset);

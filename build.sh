@@ -23,8 +23,8 @@ cat > "$app_bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleDisplayName</key><string>Relay</string>
 <key>CFBundleIconFile</key><string>Relay.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.7.1</string>
-<key>CFBundleVersion</key><string>9</string>
+<key>CFBundleShortVersionString</key><string>0.8.0</string>
+<key>CFBundleVersion</key><string>11</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
