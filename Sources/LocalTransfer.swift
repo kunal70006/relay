@@ -22,6 +22,80 @@ enum TransferActivity {
     }
 }
 
+struct TransferProgress: Identifiable, Equatable, Encodable {
+    enum State: String, Encodable { case active, complete, interrupted }
+
+    let id = UUID()
+    let name: String
+    let sending: Bool
+    let total: Int
+    var bytes: Int
+    var bytesPerSecond = 0
+    var state = State.active
+
+    var fraction: Double {
+        if state == .complete { return 1 }
+        return total == 0 ? 0 : min(0.99, Double(bytes) / Double(total))
+    }
+}
+
+private final class TransferMeter {
+    let browserID: UUID?
+    var progress: TransferProgress
+    var waitingForChunk = false
+    private(set) var updated = ContinuousClock.now
+    private var sampled: ContinuousClock.Instant
+    private var sampledBytes: Int
+    private var started: ContinuousClock.Instant
+    private var startingBytes: Int
+
+    init(name: String, sending: Bool, total: Int, offset: Int = 0, browserID: UUID? = nil) {
+        self.browserID = browserID
+        progress = TransferProgress(name: name, sending: sending, total: total, bytes: offset)
+        sampled = updated
+        started = updated
+        sampledBytes = offset
+        startingBytes = offset
+    }
+
+    func advance(to offset: Int) {
+        progress.bytes = offset
+        updated = .now
+    }
+
+    func resume(at offset: Int) {
+        waitingForChunk = false
+        if progress.state != .active || progress.bytes != offset {
+            progress.state = .active
+            progress.bytesPerSecond = 0
+            sampled = .now
+            started = sampled
+            sampledBytes = offset
+            startingBytes = offset
+        }
+        advance(to: offset)
+    }
+
+    func finish(_ state: TransferProgress.State) {
+        updated = .now
+        progress.state = state
+        progress.bytesPerSecond = state == .complete ? rate(since: started, from: startingBytes, now: updated) : 0
+    }
+
+    func sample(at now: ContinuousClock.Instant) {
+        guard progress.state == .active, sampled.duration(to: now) >= .milliseconds(500) else { return }
+        progress.bytesPerSecond = rate(since: sampled, from: sampledBytes, now: now)
+        sampled = now
+        sampledBytes = progress.bytes
+    }
+
+    private func rate(since start: ContinuousClock.Instant, from offset: Int, now: ContinuousClock.Instant) -> Int {
+        let elapsed = start.duration(to: now).components
+        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        return Int(Double(max(0, progress.bytes - offset)) / max(0.01, seconds))
+    }
+}
+
 @MainActor
 final class LocalTransferModel: ObservableObject {
     @Published var sessionURL: URL?
@@ -32,10 +106,12 @@ final class LocalTransferModel: ObservableObject {
     @Published var activity: [String] = []
     @Published var sharedFiles: [FileItem] = []
     @Published private(set) var receivedCount = 0
+    @Published private(set) var transfers: [TransferProgress] = []
     private var server: LocalHTTPServer?
     private var hasFolderScope = false
     private var networkTimer: Timer?
     private static let qrContext = CIContext()
+    private var qrImages: [URL: NSImage] = [:]
 
     func chooseFolder() {
         guard !running else { return }
@@ -72,6 +148,7 @@ final class LocalTransferModel: ObservableObject {
             activeServer.onReady = { [weak self, weak activeServer] url, ipURL in
                 DispatchQueue.main.async {
                     guard let self, let activeServer, self.server === activeServer else { return }
+                    self.qrImages = self.qrImages.filter { $0.key == url || $0.key == ipURL }
                     self.sessionURL = url
                     self.ipSessionURL = ipURL
                     self.status = nil
@@ -83,6 +160,12 @@ final class LocalTransferModel: ObservableObject {
                     if case .received = event { self.receivedCount += 1 }
                     self.activity.insert(event.message, at: 0)
                     self.activity = Array(self.activity.prefix(30))
+                }
+            }
+            activeServer.onProgress = { [weak self, weak activeServer] transfers in
+                DispatchQueue.main.async {
+                    guard let self, let activeServer, self.server === activeServer else { return }
+                    self.transfers = transfers
                 }
             }
             activeServer.onUnavailable = { [weak self, weak activeServer] message in
@@ -111,16 +194,21 @@ final class LocalTransferModel: ObservableObject {
         sessionURL = nil
         ipSessionURL = nil
         sharedFiles = []
+        transfers = []
+        qrImages.removeAll()
         status = nil
     }
 
     func qrImage(for url: URL) -> NSImage? {
+        if let image = qrImages[url] { return image }
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(Data(url.absoluteString.utf8), forKey: "inputMessage")
         filter.setValue("M", forKey: "inputCorrectionLevel")
         guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 6, y: 6)),
               let cg = Self.qrContext.createCGImage(output, from: output.extent) else { return nil }
-        return NSImage(cgImage: cg, size: NSSize(width: output.extent.width, height: output.extent.height))
+        let image = NSImage(cgImage: cg, size: NSSize(width: output.extent.width, height: output.extent.height))
+        qrImages[url] = image
+        return image
     }
 
     private static func localHostname() -> String? {
@@ -168,6 +256,7 @@ final class LocalHTTPServer {
     }()
     var onReady: ((URL, URL) -> Void)?
     var onActivity: ((TransferActivity) -> Void)?
+    var onProgress: (([TransferProgress]) -> Void)?
     var onUnavailable: ((String) -> Void)?
     private var connections: [UUID: HTTPConnection] = [:]
     private var stopped = false
@@ -178,6 +267,9 @@ final class LocalHTTPServer {
     private var port: NWEndpoint.Port = .any
     fileprivate var uploads: [UUID: UploadRecord] = [:]
     private var cleanupTimer: DispatchSourceTimer?
+    private var progressTimer: DispatchSourceTimer?
+    private var transfers: [TransferMeter] = []
+    private var publishedProgress: [TransferProgress] = []
 
     init(address: String, hostname: String? = nil, files: [URL], receiveFolder: URL?, page: Data) {
         self.address = address
@@ -202,6 +294,11 @@ final class LocalHTTPServer {
             timer.setEventHandler { [weak self] in self?.expireUploads() }
             cleanupTimer = timer
             timer.resume()
+            let progress = DispatchSource.makeTimerSource(queue: queue)
+            progress.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+            progress.setEventHandler { [weak self] in self?.publishProgress() }
+            progressTimer = progress
+            progress.resume()
         }
     }
 
@@ -285,6 +382,8 @@ final class LocalHTTPServer {
             stopped = true
             cleanupTimer?.cancel()
             cleanupTimer = nil
+            progressTimer?.cancel()
+            progressTimer = nil
             closeNetwork()
             for upload in uploads.values { upload.removeTemporaryFile() }
             uploads.removeAll()
@@ -298,6 +397,38 @@ final class LocalHTTPServer {
         for (id, upload) in stale {
             upload.removeTemporaryFile()
             uploads.removeValue(forKey: id)
+        }
+    }
+
+    fileprivate func track(_ meter: TransferMeter) {
+        if transfers.contains(where: { $0 === meter }) { return }
+        transfers.append(meter)
+        if transfers.count > 128, let index = transfers.firstIndex(where: { $0.progress.state != .active }) {
+            transfers.remove(at: index)
+        }
+    }
+
+    fileprivate func downloadProgress(for browserID: UUID) -> TransferProgress? {
+        transfers.last { $0.browserID == browserID }?.progress
+    }
+
+    private func publishProgress() {
+        let now = ContinuousClock.now
+        transfers.removeAll {
+            ($0.progress.state != .active || $0.waitingForChunk) &&
+            $0.updated.duration(to: now) > ($0.browserID == nil ? .seconds(120) : .seconds(300))
+        }
+        let visible = transfers.reversed().compactMap { meter -> TransferProgress? in
+            meter.sample(at: now)
+            let age = meter.updated.duration(to: now)
+            let progress = meter.progress
+            if progress.state != .active && age >= .seconds(6) { return nil }
+            if meter.waitingForChunk && age >= .seconds(10) { return nil }
+            return progress
+        }
+        if visible != publishedProgress {
+            publishedProgress = visible
+            onProgress?(visible)
         }
     }
 
@@ -345,10 +476,12 @@ private final class UploadRecord {
     var active = false
     var savedAs: String?
     var lastUsed = ContinuousClock.now
+    let meter: TransferMeter
 
     init(name: String, total: Int) {
         self.name = name
         self.total = total
+        meter = TransferMeter(name: name, sending: false, total: total)
     }
 
     var progress: [String: Any] {
@@ -378,6 +511,7 @@ private final class HTTPConnection {
     private var downloadRemaining = 0
     private var downloadName = ""
     private var downloadVersion: FileVersion?
+    private var downloadMeter: TransferMeter?
     private var powerActivity: NSObjectProtocol?
     private var timeout: DispatchSourceTimer?
     private var finished = false
@@ -421,7 +555,10 @@ private final class HTTPConnection {
             } else {
                 upload.removeTemporaryFile()
             }
+            upload.meter.advance(to: upload.offset)
+            upload.meter.finish(.interrupted)
         }
+        if let downloadMeter, downloadMeter.progress.state == .active { downloadMeter.finish(.interrupted) }
         try? uploadHandle?.close()
         try? downloadHandle?.close()
         uploadHandle = nil
@@ -479,11 +616,21 @@ private final class HTTPConnection {
         } else if method == "GET", path == server.prefix + "/api" {
             do { reply(200, data: try server.manifest(), type: "application/json") }
             catch { reply(500, "Could not list files") }
+        } else if method == "GET", path == server.prefix + "/download-progress" {
+            guard let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
+                  let browserID = UUID(uuidString: rawID) else { reply(400, "Invalid download ID"); return }
+            guard let progress = server.downloadProgress(for: browserID) else {
+                reply(200, data: Data("null".utf8), type: "application/json")
+                return
+            }
+            do { reply(200, data: try JSONEncoder().encode(progress), type: "application/json") }
+            catch { reply(500, "Could not report download progress") }
         } else if (method == "GET" || method == "HEAD"), path.hasPrefix(server.prefix + "/files/") {
             let key = String(path.dropFirst((server.prefix + "/files/").count))
             guard let file = server.files[key] else { reply(404, "File not found"); return }
             guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
-            download(file, version: version, range: headers["range"], ifRange: headers["if-range"], headOnly: method == "HEAD")
+            let browserID = components.queryItems?.first(where: { $0.name == "progress" })?.value.flatMap { UUID(uuidString: $0) }
+            download(file, version: version, range: headers["range"], ifRange: headers["if-range"], headOnly: method == "HEAD", browserID: browserID)
         } else if method == "GET", path == server.prefix + "/upload" {
             guard headers["x-relay-upload"] == "1", let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
                   let id = UUID(uuidString: rawID) else { reply(400, "Invalid upload ID"); return }
@@ -583,6 +730,8 @@ private final class HTTPConnection {
                 uploadHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
             }
             record.active = true
+            record.meter.resume(at: offset)
+            server.track(record.meter)
             if let id { server.uploads[id] = record }
             upload = record
             resumable = id != nil
@@ -599,6 +748,7 @@ private final class HTTPConnection {
         do {
             try handle.write(contentsOf: data)
             receivedBytes += data.count
+            upload.meter.advance(to: upload.offset + receivedBytes)
             guard receivedBytes == expectedBytes else { return }
 
             let nextOffset = upload.offset + receivedBytes
@@ -606,7 +756,10 @@ private final class HTTPConnection {
                 let name = try finishUpload(temp, in: folder, named: upload.name)
                 upload.temporaryFile = nil
                 upload.savedAs = name
+                upload.meter.finish(.complete)
                 server.onActivity?(.received(name))
+            } else {
+                upload.meter.waitingForChunk = true
             }
             upload.offset = nextOffset
             upload.active = false
@@ -653,7 +806,14 @@ private final class HTTPConnection {
         powerActivity = ProcessInfo.processInfo.beginActivity(options: .idleSystemSleepDisabled, reason: "Transferring files with Relay")
     }
 
-    private func download(_ url: URL, version: FileVersion, range: String?, ifRange: String?, headOnly: Bool) {
+    private func download(_ url: URL, version: FileVersion, range: String?, ifRange: String?, headOnly: Bool, browserID: UUID?) {
+        defer {
+            if !headOnly, let browserID, downloadMeter == nil {
+                let meter = TransferMeter(name: url.lastPathComponent, sending: true, total: version.size, browserID: browserID)
+                meter.finish(.interrupted)
+                server.track(meter)
+            }
+        }
         do {
             let fd = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW)
             guard fd >= 0 else { reply(404, "This file is no longer readable on the Mac"); return }
@@ -695,7 +855,13 @@ private final class HTTPConnection {
             responding = true
             downloadRemaining = length
             downloadName = url.lastPathComponent
-            if !headOnly { beginPowerActivity() }
+            if !headOnly {
+                let offset = partial && range?.hasSuffix("-") == true ? start : 0
+                let meter = TransferMeter(name: downloadName, sending: true, total: length + offset, offset: offset, browserID: browserID)
+                downloadMeter = meter
+                server.track(meter)
+                beginPowerActivity()
+            }
             let header = responseHeader(code: partial ? 206 : 200, count: length, type: "application/octet-stream", extra: extra)
             connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
@@ -707,6 +873,7 @@ private final class HTTPConnection {
     private func sendNextChunk() {
         guard !finished else { return }
         guard downloadRemaining > 0 else {
+            downloadMeter?.finish(.complete)
             server.onActivity?(.served(downloadName))
             close()
             return
@@ -716,9 +883,13 @@ private final class HTTPConnection {
                   let data = try handle.read(upToCount: min(262144, downloadRemaining)), !data.isEmpty,
                   FileVersion(descriptor: handle.fileDescriptor) == downloadVersion else { close(); return }
             downloadRemaining -= data.count
+            let count = data.count
             touch()
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                if error != nil { self?.close() } else { self?.sendNextChunk() }
+                guard let self, !self.finished else { return }
+                if error != nil { self.close(); return }
+                if let meter = self.downloadMeter { meter.advance(to: meter.progress.bytes + count) }
+                self.sendNextChunk()
             })
         } catch { close() }
     }

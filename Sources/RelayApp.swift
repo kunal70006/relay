@@ -176,14 +176,17 @@ struct ContentView: View {
                 Spacer()
                 Button("Stop sharing") { local.stop() }.controlSize(.large)
             }
-            if !local.activity.isEmpty {
+            if !local.transfers.isEmpty || !local.activity.isEmpty {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(local.transfers) { transfer in
+                            transferRow(transfer)
+                        }
                         ForEach(Array(local.activity.enumerated()), id: \.offset) { _, message in
                             Text(message).font(.caption).foregroundStyle(.secondary)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
-                }.frame(maxHeight: 70)
+                }.frame(maxHeight: local.transfers.isEmpty ? 70 : 126)
             }
         } else {
             HStack {
@@ -193,5 +196,29 @@ struct ContentView: View {
                 Button("Stop sharing") { local.stop() }
             }
         }
+    }
+
+    private func transferRow(_ transfer: TransferProgress) -> some View {
+        let direction = transfer.sending ? "Sending" : "Receiving"
+        let speed = ByteCountFormatter.string(fromByteCount: Int64(transfer.bytesPerSecond), countStyle: .binary)
+        let status: String
+        switch transfer.state {
+        case .active: status = "\(Int(transfer.fraction * 100))% · \(speed)/s"
+        case .complete: status = (transfer.sending ? "Sent" : "Received") + " · \(speed)/s avg"
+        case .interrupted: status = "Interrupted · \(Int(transfer.fraction * 100))%"
+        }
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 10) {
+                Label(transfer.name, systemImage: transfer.sending ? "arrow.up" : "arrow.down")
+                    .lineLimit(1)
+                    .help(direction + " " + transfer.name)
+                    .accessibilityLabel(direction + " " + transfer.name)
+                Spacer()
+                Text(status).monospacedDigit().foregroundStyle(.secondary)
+            }
+            ProgressView(value: transfer.fraction)
+                .accessibilityLabel(direction + " " + transfer.name)
+        }
+        .font(.caption)
     }
 }
