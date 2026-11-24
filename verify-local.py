@@ -106,6 +106,30 @@ passed(request("/upload?name=..%2Foutside.txt", data=b"no", headers=upload_heade
 passed(request("/upload?name=.hidden", data=b"no", headers=upload_headers)[0] == 400, "Hidden upload filenames are rejected")
 passed(request(route, data=b"", headers=upload_headers)[0] == 200, "Empty files can be uploaded")
 
+
+def folder_upload(directory, name, data, batch):
+    query = urllib.parse.urlencode({"name": name, "dir": directory, "batch": batch}, quote_via=urllib.parse.quote)
+    return request("/upload?" + query, data=data, headers=upload_headers)
+
+
+folder_name = f"Folder upload ✓ {uuid.uuid4().hex[:8]}"
+first_batch = str(uuid.uuid4())
+code, _, result = folder_upload(f"{folder_name}/nested/deeper", "photo.bin", b"first", first_batch)
+saved = json.loads(result)["savedAs"]
+passed(code == 200 and saved == f"{folder_name}/nested/deeper/photo.bin" and (destination / saved).read_bytes() == b"first",
+       "Folder uploads recreate their subfolders in the chosen folder")
+code, _, result = folder_upload(folder_name, "top.txt", b"top", first_batch)
+passed(code == 200 and json.loads(result)["savedAs"] == f"{folder_name}/top.txt", "Files from one folder upload stay together")
+code, _, result = folder_upload(f"{folder_name}/nested", "photo.bin", b"second", str(uuid.uuid4()))
+second = json.loads(result)["savedAs"]
+passed(code == 200 and second == f"{folder_name} (1)/nested/photo.bin" and (destination / saved).read_bytes() == b"first",
+       "A second upload of the same folder gets its own folder")
+for bad in ["../outside", "a/../../outside", "a//b", ".hidden", "a/.git", "/absolute", "a\\b"]:
+    passed(folder_upload(bad, "x.txt", b"no", str(uuid.uuid4()))[0] == 400, f"Unsafe folder path {bad!r} is rejected")
+passed(request("/upload?" + urllib.parse.urlencode({"name": "x.txt", "dir": "NoBatch"}), data=b"no", headers=upload_headers)[0] == 400,
+       "Folder uploads require a batch ID")
+passed(not (destination.parent / "outside").exists() and not (destination / "NoBatch").exists(), "Rejected folder uploads create nothing")
+
 before = set(destination.glob(".relay-*.part"))
 with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
     header = f"POST {parsed.path}/upload?name=interrupted.txt HTTP/1.1\r\nHost: {parsed.netloc}\r\nOrigin: {origin}\r\nX-Relay-Upload: 1\r\nContent-Length: 1000000\r\n\r\n"

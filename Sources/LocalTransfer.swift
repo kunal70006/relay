@@ -268,6 +268,9 @@ final class LocalHTTPServer {
     private var hostname: String?
     private var port: NWEndpoint.Port = .any
     fileprivate var uploads: [UUID: UploadRecord] = [:]
+    // Each uploaded folder gets its own new top-level folder, so a second copy
+    // becomes "Photos (1)" instead of mixing into an existing "Photos".
+    private var folderRoots: [UUID: String] = [:]
     private var cleanupTimer: DispatchSourceTimer?
     private var progressTimer: DispatchSourceTimer?
     private var transfers: [TransferMeter] = []
@@ -393,6 +396,54 @@ final class LocalHTTPServer {
         }
     }
 
+    // Validates a folder path sent by the browser, such as "Photos/2026/Trip".
+    static func uploadDirectory(_ path: String) -> [String]? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.count <= 64, path.utf8.count <= 1024 else { return nil }
+        for part in parts {
+            guard !part.isEmpty, !part.hasPrefix("."), !part.contains("\\"), part.utf8.count <= 220,
+                  !part.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else { return nil }
+        }
+        return parts
+    }
+
+    // Creates the folders for an upload and returns the target folder and its
+    // path relative to the receiving folder.
+    fileprivate func uploadDirectory(_ parts: [String], batch: UUID, in folder: URL) throws -> (URL, String) {
+        func isDirectory(_ url: URL) -> Bool {
+            var info = stat()
+            return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
+        }
+        var root = folderRoots[batch]
+        if root == nil || !isDirectory(folder.appendingPathComponent(root!)) {
+            root = try Self.makeUniqueDirectory(parts[0], in: folder)
+            if folderRoots.count >= 4096 { folderRoots.removeAll() }
+            folderRoots[batch] = root
+        }
+        var target = folder.appendingPathComponent(root!)
+        var relative = root!
+        for part in parts.dropFirst() {
+            target.appendPathComponent(part)
+            relative += "/" + part
+            if mkdir(target.path, 0o755) != 0, errno != EEXIST {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard isDirectory(target) else {
+                throw LocalTransferError.message("A file named \(part) is in the way")
+            }
+        }
+        return (target, relative)
+    }
+
+    private static func makeUniqueDirectory(_ name: String, in folder: URL) throws -> String {
+        for suffix in 0..<10_000 {
+            let candidate = suffix == 0 ? name : "\(name) (\(suffix))"
+            if mkdir(folder.appendingPathComponent(candidate).path, 0o755) == 0 { return candidate }
+            guard errno == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+        throw LocalTransferError.message("Could not find a free folder name")
+    }
+
     fileprivate func expireUploads() {
         let stale = uploads.filter {
             $0.value.savedAs == nil && !$0.value.active && $0.value.lastUsed.duration(to: .now) > .seconds(1800)
@@ -401,6 +452,15 @@ final class LocalHTTPServer {
             upload.removeTemporaryFile()
             uploads.removeValue(forKey: id)
         }
+    }
+
+    // Saved uploads are kept only so the browser can confirm them after a
+    // dropped connection. Large folders can exceed the record limit, so the
+    // oldest confirmations make room for new uploads.
+    fileprivate func forgetOldestSavedUpload() {
+        let saved = uploads.filter { $0.value.savedAs != nil }
+        guard let oldest = saved.min(by: { $0.value.lastUsed < $1.value.lastUsed }) else { return }
+        uploads.removeValue(forKey: oldest.key)
     }
 
     fileprivate func track(_ meter: TransferMeter) {
@@ -478,6 +538,8 @@ struct FileVersion: Equatable {
 private final class UploadRecord {
     let name: String
     let total: Int
+    let directory: [String]
+    let batch: UUID?
     var temporaryFile: URL?
     var offset = 0
     var active = false
@@ -485,9 +547,11 @@ private final class UploadRecord {
     var lastUsed = ContinuousClock.now
     let meter: TransferMeter
 
-    init(name: String, total: Int) {
+    init(name: String, total: Int, directory: [String], batch: UUID?) {
         self.name = name
         self.total = total
+        self.directory = directory
+        self.batch = batch
         meter = TransferMeter(name: name, sending: false, total: total)
     }
 
@@ -671,6 +735,18 @@ private final class HTTPConnection {
             reply(400, "Unsupported filename")
             return
         }
+        var directory: [String] = []
+        var batch: UUID?
+        if let rawDirectory = query.first(where: { $0.name == "dir" })?.value {
+            guard let parts = LocalHTTPServer.uploadDirectory(rawDirectory),
+                  let rawBatch = query.first(where: { $0.name == "batch" })?.value,
+                  let batchID = UUID(uuidString: rawBatch) else {
+                reply(400, "Unsupported folder name")
+                return
+            }
+            directory = parts
+            batch = batchID
+        }
         var id: UUID?
         var total = length
         var offset = 0
@@ -691,7 +767,7 @@ private final class HTTPConnection {
         server.expireUploads()
         let record: UploadRecord
         if let id, let existing = server.uploads[id] {
-            guard name == existing.name, total == existing.total else { reply(400, "Upload details changed"); return }
+            guard name == existing.name, total == existing.total, directory == existing.directory, batch == existing.batch else { reply(400, "Upload details changed"); return }
             existing.lastUsed = .now
             if existing.active || existing.savedAs != nil || existing.offset != offset {
                 replyProgress(existing.progress)
@@ -700,6 +776,9 @@ private final class HTTPConnection {
             record = existing
         } else {
             guard offset == 0 else { replyProgress(["offset": 0]); return }
+            if id != nil, server.uploads.count >= 4096 {
+                server.forgetOldestSavedUpload()
+            }
             if id != nil, server.uploads.count >= 4096 || server.uploads.values.filter({ $0.savedAs == nil }).count >= 16 {
                 reply(429, "Too many saved uploads. Try again later or start a new session.")
                 return
@@ -709,7 +788,7 @@ private final class HTTPConnection {
                 reply(507, "Not enough free space on the Mac")
                 return
             }
-            record = UploadRecord(name: name, total: total)
+            record = UploadRecord(name: name, total: total, directory: directory, batch: batch)
         }
 
         do {
@@ -764,7 +843,14 @@ private final class HTTPConnection {
             // uncommitted if moving the file into place fails.
             let nextOffset = upload.offset + data.count
             if nextOffset == upload.total, let temp = upload.temporaryFile {
-                let name = try finishUpload(temp, in: folder, named: upload.name)
+                var target = folder
+                var prefix = ""
+                if let batch = upload.batch, !upload.directory.isEmpty {
+                    let (directory, relative) = try server.uploadDirectory(upload.directory, batch: batch, in: folder)
+                    target = directory
+                    prefix = relative + "/"
+                }
+                let name = try prefix + finishUpload(temp, in: target, named: upload.name)
                 upload.temporaryFile = nil
                 upload.savedAs = name
             }

@@ -10,11 +10,11 @@ Send and receive files between a Mac running Relay and a phone, tablet, or compu
 
 1. In Relay, add files or folders to send, choose a folder to receive into, or do both.
 2. Click **Start sharing**. On the other device, scan the QR code or open the session link in a browser.
-3. Choose **Download** or **Choose files** on the transfer page. Click **Stop sharing** on the Mac when done.
+3. Choose **Download**, **Choose files**, or **Choose folder** on the transfer page. Click **Stop sharing** on the Mac when done.
 
 The IP link is the default. **Use Mac name** gives you a link that can keep working after both devices switch to a Wi-Fi network that supports Bonjour.
 
-Shared folders download as .zip files that include subfolders but leave out hidden files and links. If a folder download stops, it starts again from the beginning.
+Shared folders download as .zip files that include subfolders but leave out hidden files and links. If a folder download stops, it starts again from the beginning. Folders sent to the Mac keep their subfolders and are saved in a new folder, so they never mix with existing files. **Choose folder** appears in browsers that support picking folders, which most phone browsers do not.
 
 Keep the upload tab open for automatic retries. Uploads support up to 20 GiB per file. Transfers use unencrypted HTTP, so use trusted Wi-Fi and keep the session link private.
 
