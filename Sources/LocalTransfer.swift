@@ -244,6 +244,7 @@ final class LocalHTTPServer {
     let queue = DispatchQueue(label: "local.relay.http")
     let prefix = "/s/" + UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     let files: [String: URL]
+    let folders: Set<String>
     fileprivate let versions: [String: FileVersion]
     let receiveFolder: URL?
     private let page: Data
@@ -276,6 +277,7 @@ final class LocalHTTPServer {
         self.hostname = hostname
         let shared = Dictionary(uniqueKeysWithValues: files.map { (UUID().uuidString, $0) })
         self.files = shared
+        folders = Set(shared.filter { (try? $0.value.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }.keys)
         versions = shared.compactMapValues { FileVersion(path: $0.path) }
         self.receiveFolder = receiveFolder
         self.page = page
@@ -434,8 +436,12 @@ final class LocalHTTPServer {
 
     func manifest() throws -> Data {
         let items: [[String: Any]] = files.sorted { $0.value.lastPathComponent < $1.value.lastPathComponent }.map { key, url in
-            let size = versions[key]?.size ?? 0
-            return ["id": key, "name": url.lastPathComponent, "size": size]
+            guard folders.contains(key) else {
+                return ["id": key, "name": url.lastPathComponent, "size": versions[key]?.size ?? 0]
+            }
+            let archive = try? FolderArchive(folder: url)
+            return ["id": key, "name": url.lastPathComponent + ".zip", "size": archive?.length ?? 0,
+                    "folder": true, "items": archive?.fileCount ?? 0]
         }
         return try JSONSerialization.data(withJSONObject: ["files": items, "canUpload": receiveFolder != nil])
     }
@@ -443,7 +449,7 @@ final class LocalHTTPServer {
     func sessionPage() -> Data { initialPage }
 }
 
-private struct FileVersion: Equatable {
+struct FileVersion: Equatable {
     let size: Int
     let tag: String
 
@@ -459,7 +465,7 @@ private struct FileVersion: Equatable {
         self.init(info)
     }
 
-    private init?(_ info: stat) {
+    init?(_ info: stat) {
         guard info.st_mode & S_IFMT == S_IFREG else { return nil }
         size = Int(info.st_size)
         let modified = info.st_mtimespec
@@ -511,6 +517,7 @@ private final class HTTPConnection {
     private var downloadRemaining = 0
     private var downloadName = ""
     private var downloadVersion: FileVersion?
+    private var zipReader: FolderZipReader?
     private var downloadMeter: TransferMeter?
     private var powerActivity: NSObjectProtocol?
     private var timeout: DispatchSourceTimer?
@@ -628,8 +635,12 @@ private final class HTTPConnection {
         } else if (method == "GET" || method == "HEAD"), path.hasPrefix(server.prefix + "/files/") {
             let key = String(path.dropFirst((server.prefix + "/files/").count))
             guard let file = server.files[key] else { reply(404, "File not found"); return }
-            guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
             let browserID = components.queryItems?.first(where: { $0.name == "progress" })?.value.flatMap { UUID(uuidString: $0) }
+            if server.folders.contains(key) {
+                downloadFolder(file, headOnly: method == "HEAD", browserID: browserID)
+                return
+            }
+            guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
             download(file, version: version, range: headers["range"], ifRange: headers["if-range"], headOnly: method == "HEAD", browserID: browserID)
         } else if method == "GET", path == server.prefix + "/upload" {
             guard headers["x-relay-upload"] == "1", let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
@@ -874,6 +885,39 @@ private final class HTTPConnection {
         } catch { reply(404, "This file is no longer readable on the Mac") }
     }
 
+    // Folders stream as a freshly scanned ZIP. Range requests are ignored and
+    // answered with the whole archive, because resuming mid-archive would need
+    // the CRCs of every earlier file.
+    private func downloadFolder(_ url: URL, headOnly: Bool, browserID: UUID?) {
+        let archive: FolderArchive
+        do { archive = try FolderArchive(folder: url) } catch {
+            if !headOnly, let browserID {
+                let meter = TransferMeter(name: url.lastPathComponent + ".zip", sending: true, total: 0, browserID: browserID)
+                meter.finish(.interrupted)
+                server.track(meter)
+            }
+            reply(404, error.localizedDescription)
+            return
+        }
+        let filename = archive.name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "folder.zip"
+        let extra = "Content-Disposition: attachment; filename=\"download.zip\"; filename*=UTF-8''\(filename)\r\n"
+        responding = true
+        downloadRemaining = archive.length
+        downloadName = archive.name
+        zipReader = FolderZipReader(archive)
+        if !headOnly {
+            let meter = TransferMeter(name: downloadName, sending: true, total: archive.length, browserID: browserID)
+            downloadMeter = meter
+            server.track(meter)
+            beginPowerActivity()
+        }
+        let header = responseHeader(code: 200, count: archive.length, type: "application/zip", extra: extra)
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil || headOnly { self.close() } else { self.sendNextChunk() }
+        })
+    }
+
     private func sendNextChunk() {
         guard !finished else { return }
         guard downloadRemaining > 0 else {
@@ -883,9 +927,16 @@ private final class HTTPConnection {
             return
         }
         do {
-            guard let handle = downloadHandle,
-                  let data = try handle.read(upToCount: min(262144, downloadRemaining)), !data.isEmpty,
-                  FileVersion(descriptor: handle.fileDescriptor) == downloadVersion else { close(); return }
+            let data: Data
+            if let zipReader {
+                data = try zipReader.read(upTo: min(262144, downloadRemaining))
+                guard !data.isEmpty else { close(); return }
+            } else {
+                guard let handle = downloadHandle,
+                      let chunk = try handle.read(upToCount: min(262144, downloadRemaining)), !chunk.isEmpty,
+                      FileVersion(descriptor: handle.fileDescriptor) == downloadVersion else { close(); return }
+                data = chunk
+            }
             downloadRemaining -= data.count
             let count = data.count
             touch()

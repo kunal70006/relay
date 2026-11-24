@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Check a running Relay session using generated files only.
 
-Usage: python3 verify-local.py SESSION_URL RECEIVING_FOLDER STREAMING_TEST_FILE
+Usage: python3 verify-local.py SESSION_URL RECEIVING_FOLDER STREAMING_TEST_FILE [SHARED_FOLDER]
 Start a session with a generated 32 MB file and a disposable receiving folder.
-Pass the absolute paths to the receiving folder and shared file.
+Pass the absolute paths to the receiving folder and shared file. To check
+folder sharing, also share a generated folder and pass its absolute path.
 """
 import hashlib
+import io
 import json
 import pathlib
 import socket
@@ -15,10 +17,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 
 base = sys.argv[1].rstrip("/")
 destination = pathlib.Path(sys.argv[2])
 source = pathlib.Path(sys.argv[3])
+shared_folder = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 else None
 parsed = urllib.parse.urlsplit(base)
 origin = f"{parsed.scheme}://{parsed.netloc}"
 client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -58,6 +62,27 @@ code, _, chunk = request(file_route, headers={"Range": "bytes=-321"})
 passed(code == 206 and chunk == expected[-321:], "Suffix ranges return the correct bytes")
 passed(request(file_route, headers={"Range": "bytes=999999999999-"})[0] == 416, "Invalid ranges are rejected")
 passed(request("/files/not-shared")[0] == 404, "Unselected files cannot be downloaded")
+
+if shared_folder:
+    entry = next(file for file in manifest["files"] if file.get("folder") and file["name"] == shared_folder.name + ".zip")
+    folder_route = "/files/" + entry["id"]
+    code, headers, archive = request(folder_route)
+    passed(code == 200 and len(archive) == entry["size"] == int(headers["Content-Length"]), "A shared folder downloads at its advertised ZIP size")
+    passed(headers["Content-Type"] == "application/zip" and ".zip" in headers["Content-Disposition"], "Folder downloads are saved as .zip files")
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        passed(bundle.testzip() is None, "The folder ZIP passes CRC checks")
+        on_disk = {
+            str(path.relative_to(shared_folder.parent)): path.read_bytes()
+            for path in shared_folder.rglob("*")
+            if path.is_file() and not path.is_symlink()
+            and not any(part.startswith(".") for part in path.relative_to(shared_folder).parts)
+        }
+        in_zip = {info.filename: bundle.read(info) for info in bundle.infolist() if not info.is_dir()}
+        passed(in_zip == on_disk and entry["items"] == len(on_disk), "The folder ZIP holds every visible file with its exact bytes")
+    code, headers, body = request(folder_route, method="HEAD")
+    passed(code == 200 and not body and int(headers["Content-Length"]) == entry["size"], "HEAD reports the folder ZIP size")
+    code, _, whole = request(folder_route, headers={"Range": "bytes=100-"})
+    passed(code == 200 and whole == archive, "Folder downloads ignore ranges and resend the whole ZIP")
 bad_base = base.replace(parsed.path, "/s/not-a-valid-session")
 try:
     client.open(bad_base + "/api", timeout=5)

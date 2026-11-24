@@ -64,10 +64,11 @@ struct ContentView: View {
                 }
             }
             HStack(spacing: 12) {
-                Label(dropTarget ? "Drop to add" : "Drop files here", systemImage: "tray.and.arrow.down")
+                Label(dropTarget ? "Drop to add" : "Drop files or folders here", systemImage: "tray.and.arrow.down")
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Choose files…") { files.chooseFiles() }
+                Button("Choose…") { files.chooseFiles() }
+                    .help("Choose files or folders to send")
                     .keyboardShortcut("o")
             }
             .padding(14)
@@ -89,10 +90,10 @@ struct ContentView: View {
                     LazyVStack(spacing: 4) {
                         ForEach(files.outgoing) { item in
                             HStack(spacing: 8) {
-                                Image(systemName: "doc").foregroundStyle(.secondary)
+                                Image(systemName: item.isFolder ? "folder" : "doc").foregroundStyle(.secondary)
                                 Text(item.name).lineLimit(1).help(item.url.path)
                                 Spacer()
-                                Text(item.size).foregroundStyle(.secondary)
+                                Text(item.detail).foregroundStyle(.secondary)
                                 Button { files.remove(item) } label: {
                                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                                 }
@@ -109,6 +110,9 @@ struct ContentView: View {
             }
             if let notice = files.notice {
                 Text(notice).font(.caption).foregroundStyle(.secondary)
+            } else if files.outgoing.contains(where: \.isFolder) {
+                Text("Folders download as .zip files. Hidden files and links are left out.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Divider()
             HStack {
@@ -164,7 +168,7 @@ struct ContentView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     let count = local.sharedFiles.count
-                    Text(count == 0 ? "Receiving only" : "\(count) \(count == 1 ? "file" : "files") to download")
+                    Text(count == 0 ? "Receiving only" : "\(count) \(count == 1 ? "item" : "items") to download")
                     if local.receiveFolder != nil {
                         Text("\(local.receivedCount) received")
                     }
