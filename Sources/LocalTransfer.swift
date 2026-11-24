@@ -118,6 +118,7 @@ final class LocalTransferModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         panel.message = "Relay saves uploads here and keeps existing files."
         panel.prompt = "Receive files here"

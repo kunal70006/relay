@@ -67,6 +67,7 @@ final class TransferModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Add files"
         if let window = NSApp.keyWindow {
