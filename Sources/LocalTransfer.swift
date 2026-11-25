@@ -118,6 +118,7 @@ final class LocalTransferModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
         panel.message = "Relay saves uploads here and keeps existing files."
         panel.prompt = "Receive files here"
@@ -239,21 +240,19 @@ final class LocalTransferModel: ObservableObject {
 }
 
 // A session-scoped HTTP server, bound to the Mac's Wi-Fi address only.
-// All connection state and file I/O run on one serial queue.
+// Connection state and streaming I/O run on one serial queue. Folder scans
+// use a separate queue so directory enumeration cannot stall active transfers.
 final class LocalHTTPServer {
     let queue = DispatchQueue(label: "local.relay.http")
+    private let folderScanQueue = DispatchQueue(label: "local.relay.folder-scans", qos: .utility)
     let prefix = "/s/" + UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     let files: [String: URL]
+    let folders: Set<String>
     fileprivate let versions: [String: FileVersion]
     let receiveFolder: URL?
     private let page: Data
-    private lazy var initialPage: Data = {
-        guard let html = String(data: page, encoding: .utf8),
-              let data = try? manifest() else { return page }
-        let json = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "<", with: "\\u003c")
-        let script = "<script id=\"session-data\" type=\"application/json\">\(json)</script>"
-        return Data(html.replacingOccurrences(of: "<!-- relay:session-data -->", with: script).utf8)
-    }()
+    private var folderMetadata: [String: (size: Int, count: Int)] = [:]
+    private var folderScans: [String: [(Result<FolderArchive, Error>) -> Void]] = [:]
     var onReady: ((URL, URL) -> Void)?
     var onActivity: ((TransferActivity) -> Void)?
     var onProgress: (([TransferProgress]) -> Void)?
@@ -266,6 +265,9 @@ final class LocalHTTPServer {
     private var hostname: String?
     private var port: NWEndpoint.Port = .any
     fileprivate var uploads: [UUID: UploadRecord] = [:]
+    // Each uploaded folder gets its own new top-level folder, so a second copy
+    // becomes "Photos (1)" instead of mixing into an existing "Photos".
+    private var folderRoots: [UUID: String] = [:]
     private var cleanupTimer: DispatchSourceTimer?
     private var progressTimer: DispatchSourceTimer?
     private var transfers: [TransferMeter] = []
@@ -276,6 +278,7 @@ final class LocalHTTPServer {
         self.hostname = hostname
         let shared = Dictionary(uniqueKeysWithValues: files.map { (UUID().uuidString, $0) })
         self.files = shared
+        folders = Set(shared.filter { (try? $0.value.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }.keys)
         versions = shared.compactMapValues { FileVersion(path: $0.path) }
         self.receiveFolder = receiveFolder
         self.page = page
@@ -385,9 +388,58 @@ final class LocalHTTPServer {
             progressTimer?.cancel()
             progressTimer = nil
             closeNetwork()
+            folderScans.removeAll()
             for upload in uploads.values { upload.removeTemporaryFile() }
             uploads.removeAll()
         }
+    }
+
+    // Validates a folder path sent by the browser, such as "Photos/2026/Trip".
+    static func uploadDirectory(_ path: String) -> [String]? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard !parts.isEmpty, parts.count <= 64, path.utf8.count <= 1024 else { return nil }
+        for part in parts {
+            guard !part.isEmpty, !part.hasPrefix("."), !part.contains("\\"), part.utf8.count <= 220,
+                  !part.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else { return nil }
+        }
+        return parts
+    }
+
+    // Creates the folders for an upload and returns the target folder and its
+    // path relative to the receiving folder.
+    fileprivate func uploadDirectory(_ parts: [String], batch: UUID, in folder: URL) throws -> (URL, String) {
+        func isDirectory(_ url: URL) -> Bool {
+            var info = stat()
+            return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
+        }
+        var root = folderRoots[batch]
+        if root == nil || !isDirectory(folder.appendingPathComponent(root!)) {
+            root = try Self.makeUniqueDirectory(parts[0], in: folder)
+            if folderRoots.count >= 4096 { folderRoots.removeAll() }
+            folderRoots[batch] = root
+        }
+        var target = folder.appendingPathComponent(root!)
+        var relative = root!
+        for part in parts.dropFirst() {
+            target.appendPathComponent(part)
+            relative += "/" + part
+            if mkdir(target.path, 0o755) != 0, errno != EEXIST {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard isDirectory(target) else {
+                throw LocalTransferError.message("A file named \(part) is in the way")
+            }
+        }
+        return (target, relative)
+    }
+
+    private static func makeUniqueDirectory(_ name: String, in folder: URL) throws -> String {
+        for suffix in 0..<10_000 {
+            let candidate = suffix == 0 ? name : "\(name) (\(suffix))"
+            if mkdir(folder.appendingPathComponent(candidate).path, 0o755) == 0 { return candidate }
+            guard errno == EEXIST else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        }
+        throw LocalTransferError.message("Could not find a free folder name")
     }
 
     fileprivate func expireUploads() {
@@ -398,6 +450,15 @@ final class LocalHTTPServer {
             upload.removeTemporaryFile()
             uploads.removeValue(forKey: id)
         }
+    }
+
+    // Saved uploads are kept only so the browser can confirm them after a
+    // dropped connection. Large folders can exceed the record limit, so the
+    // oldest confirmations make room for new uploads.
+    fileprivate func forgetOldestSavedUpload() {
+        let saved = uploads.filter { $0.value.savedAs != nil }
+        guard let oldest = saved.min(by: { $0.value.lastUsed < $1.value.lastUsed }) else { return }
+        uploads.removeValue(forKey: oldest.key)
     }
 
     fileprivate func track(_ meter: TransferMeter) {
@@ -432,18 +493,61 @@ final class LocalHTTPServer {
         }
     }
 
+    // Listing requests share the initial scan and then reuse its summary.
+    // A download always requests a fresh scan and refreshes that summary.
+    fileprivate func prepareManifest(_ completion: @escaping () -> Void) {
+        let pending = folders.filter { folderMetadata[$0] == nil }
+        guard !pending.isEmpty else { completion(); return }
+        var remaining = pending.count
+        for key in pending {
+            scanFolder(key) { _ in
+                remaining -= 1
+                if remaining == 0 { completion() }
+            }
+        }
+    }
+
+    fileprivate func scanFolder(_ key: String, completion: @escaping (Result<FolderArchive, Error>) -> Void) {
+        if folderScans[key] != nil {
+            folderScans[key]?.append(completion)
+            return
+        }
+        guard let folder = files[key] else { return }
+        folderScans[key] = [completion]
+        folderScanQueue.async { [weak self] in
+            let result = Result { try FolderArchive(folder: folder) }
+            let metadata = result.map { (size: $0.length, count: $0.fileCount) }
+            self?.queue.async { [weak self] in
+                guard let self, !self.stopped else { return }
+                self.folderMetadata[key] = (try? metadata.get()) ?? (size: 0, count: 0)
+                let callbacks = self.folderScans.removeValue(forKey: key) ?? []
+                for callback in callbacks { callback(result) }
+            }
+        }
+    }
+
     func manifest() throws -> Data {
         let items: [[String: Any]] = files.sorted { $0.value.lastPathComponent < $1.value.lastPathComponent }.map { key, url in
-            let size = versions[key]?.size ?? 0
-            return ["id": key, "name": url.lastPathComponent, "size": size]
+            guard folders.contains(key) else {
+                return ["id": key, "name": url.lastPathComponent, "size": versions[key]?.size ?? 0]
+            }
+            let metadata = folderMetadata[key]
+            return ["id": key, "name": url.lastPathComponent + ".zip", "size": metadata?.size ?? 0,
+                    "folder": true, "items": metadata?.count ?? 0]
         }
         return try JSONSerialization.data(withJSONObject: ["files": items, "canUpload": receiveFolder != nil])
     }
 
-    func sessionPage() -> Data { initialPage }
+    func sessionPage() -> Data {
+        guard let html = String(data: page, encoding: .utf8),
+              let data = try? manifest() else { return page }
+        let json = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "<", with: "\\u003c")
+        let script = "<script id=\"session-data\" type=\"application/json\">\(json)</script>"
+        return Data(html.replacingOccurrences(of: "<!-- relay:session-data -->", with: script).utf8)
+    }
 }
 
-private struct FileVersion: Equatable {
+struct FileVersion: Equatable {
     let size: Int
     let tag: String
 
@@ -459,7 +563,7 @@ private struct FileVersion: Equatable {
         self.init(info)
     }
 
-    private init?(_ info: stat) {
+    init?(_ info: stat) {
         guard info.st_mode & S_IFMT == S_IFREG else { return nil }
         size = Int(info.st_size)
         let modified = info.st_mtimespec
@@ -471,6 +575,8 @@ private struct FileVersion: Equatable {
 private final class UploadRecord {
     let name: String
     let total: Int
+    let directory: [String]
+    let batch: UUID?
     var temporaryFile: URL?
     var offset = 0
     var active = false
@@ -478,9 +584,11 @@ private final class UploadRecord {
     var lastUsed = ContinuousClock.now
     let meter: TransferMeter
 
-    init(name: String, total: Int) {
+    init(name: String, total: Int, directory: [String], batch: UUID?) {
         self.name = name
         self.total = total
+        self.directory = directory
+        self.batch = batch
         meter = TransferMeter(name: name, sending: false, total: total)
     }
 
@@ -511,6 +619,7 @@ private final class HTTPConnection {
     private var downloadRemaining = 0
     private var downloadName = ""
     private var downloadVersion: FileVersion?
+    private var zipReader: FolderZipReader?
     private var downloadMeter: TransferMeter?
     private var powerActivity: NSObjectProtocol?
     private var timeout: DispatchSourceTimer?
@@ -612,10 +721,20 @@ private final class HTTPConnection {
         guard let host = headers["host"], server.acceptsHost(host) else { reply(403, "Unexpected host"); return }
         guard headers["transfer-encoding"] == nil else { reply(400, "Chunked requests are not supported"); return }
         if method == "GET", path == server.prefix + "/" {
-            reply(200, data: server.sessionPage(), type: "text/html; charset=utf-8")
+            responding = true
+            server.prepareManifest { [weak self] in
+                guard let self, !self.finished else { return }
+                self.responding = false
+                self.reply(200, data: self.server.sessionPage(), type: "text/html; charset=utf-8")
+            }
         } else if method == "GET", path == server.prefix + "/api" {
-            do { reply(200, data: try server.manifest(), type: "application/json") }
-            catch { reply(500, "Could not list files") }
+            responding = true
+            server.prepareManifest { [weak self] in
+                guard let self, !self.finished else { return }
+                self.responding = false
+                do { self.reply(200, data: try self.server.manifest(), type: "application/json") }
+                catch { self.reply(500, "Could not list files") }
+            }
         } else if method == "GET", path == server.prefix + "/download-progress" {
             guard let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
                   let browserID = UUID(uuidString: rawID) else { reply(400, "Invalid download ID"); return }
@@ -628,8 +747,12 @@ private final class HTTPConnection {
         } else if (method == "GET" || method == "HEAD"), path.hasPrefix(server.prefix + "/files/") {
             let key = String(path.dropFirst((server.prefix + "/files/").count))
             guard let file = server.files[key] else { reply(404, "File not found"); return }
-            guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
             let browserID = components.queryItems?.first(where: { $0.name == "progress" })?.value.flatMap { UUID(uuidString: $0) }
+            if server.folders.contains(key) {
+                downloadFolder(key, url: file, headOnly: method == "HEAD", browserID: browserID)
+                return
+            }
+            guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
             download(file, version: version, range: headers["range"], ifRange: headers["if-range"], headOnly: method == "HEAD", browserID: browserID)
         } else if method == "GET", path == server.prefix + "/upload" {
             guard headers["x-relay-upload"] == "1", let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
@@ -659,6 +782,18 @@ private final class HTTPConnection {
             reply(400, "Unsupported filename")
             return
         }
+        var directory: [String] = []
+        var batch: UUID?
+        if let rawDirectory = query.first(where: { $0.name == "dir" })?.value {
+            guard let parts = LocalHTTPServer.uploadDirectory(rawDirectory),
+                  let rawBatch = query.first(where: { $0.name == "batch" })?.value,
+                  let batchID = UUID(uuidString: rawBatch) else {
+                reply(400, "Unsupported folder name")
+                return
+            }
+            directory = parts
+            batch = batchID
+        }
         var id: UUID?
         var total = length
         var offset = 0
@@ -679,7 +814,7 @@ private final class HTTPConnection {
         server.expireUploads()
         let record: UploadRecord
         if let id, let existing = server.uploads[id] {
-            guard name == existing.name, total == existing.total else { reply(400, "Upload details changed"); return }
+            guard name == existing.name, total == existing.total, directory == existing.directory, batch == existing.batch else { reply(400, "Upload details changed"); return }
             existing.lastUsed = .now
             if existing.active || existing.savedAs != nil || existing.offset != offset {
                 replyProgress(existing.progress)
@@ -688,6 +823,9 @@ private final class HTTPConnection {
             record = existing
         } else {
             guard offset == 0 else { replyProgress(["offset": 0]); return }
+            if id != nil, server.uploads.count >= 4096 {
+                server.forgetOldestSavedUpload()
+            }
             if id != nil, server.uploads.count >= 4096 || server.uploads.values.filter({ $0.savedAs == nil }).count >= 16 {
                 reply(429, "Too many saved uploads. Try again later or start a new session.")
                 return
@@ -697,7 +835,7 @@ private final class HTTPConnection {
                 reply(507, "Not enough free space on the Mac")
                 return
             }
-            record = UploadRecord(name: name, total: total)
+            record = UploadRecord(name: name, total: total, directory: directory, batch: batch)
         }
 
         do {
@@ -752,7 +890,14 @@ private final class HTTPConnection {
             // uncommitted if moving the file into place fails.
             let nextOffset = upload.offset + data.count
             if nextOffset == upload.total, let temp = upload.temporaryFile {
-                let name = try finishUpload(temp, in: folder, named: upload.name)
+                var target = folder
+                var prefix = ""
+                if let batch = upload.batch, !upload.directory.isEmpty {
+                    let (directory, relative) = try server.uploadDirectory(upload.directory, batch: batch, in: folder)
+                    target = directory
+                    prefix = relative + "/"
+                }
+                let name = try prefix + finishUpload(temp, in: target, named: upload.name)
                 upload.temporaryFile = nil
                 upload.savedAs = name
             }
@@ -874,6 +1019,48 @@ private final class HTTPConnection {
         } catch { reply(404, "This file is no longer readable on the Mac") }
     }
 
+    // Folders stream as a freshly scanned ZIP. Range requests are ignored and
+    // answered with the whole archive, because resuming mid-archive would need
+    // the CRCs of every earlier file.
+    private func downloadFolder(_ key: String, url: URL, headOnly: Bool, browserID: UUID?) {
+        responding = true
+        server.scanFolder(key) { [weak self] result in
+            guard let self, !self.finished else { return }
+            self.responding = false
+            self.sendFolder(result, url: url, headOnly: headOnly, browserID: browserID)
+        }
+    }
+
+    private func sendFolder(_ result: Result<FolderArchive, Error>, url: URL, headOnly: Bool, browserID: UUID?) {
+        let archive: FolderArchive
+        do { archive = try result.get() } catch {
+            if !headOnly, let browserID {
+                let meter = TransferMeter(name: url.lastPathComponent + ".zip", sending: true, total: 0, browserID: browserID)
+                meter.finish(.interrupted)
+                server.track(meter)
+            }
+            reply(404, error.localizedDescription)
+            return
+        }
+        let filename = archive.name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "folder.zip"
+        let extra = "Content-Disposition: attachment; filename=\"download.zip\"; filename*=UTF-8''\(filename)\r\n"
+        responding = true
+        downloadRemaining = archive.length
+        downloadName = archive.name
+        zipReader = FolderZipReader(archive)
+        if !headOnly {
+            let meter = TransferMeter(name: downloadName, sending: true, total: archive.length, browserID: browserID)
+            downloadMeter = meter
+            server.track(meter)
+            beginPowerActivity()
+        }
+        let header = responseHeader(code: 200, count: archive.length, type: "application/zip", extra: extra)
+        connection.send(content: Data(header.utf8), completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil || headOnly { self.close() } else { self.sendNextChunk() }
+        })
+    }
+
     private func sendNextChunk() {
         guard !finished else { return }
         guard downloadRemaining > 0 else {
@@ -883,9 +1070,16 @@ private final class HTTPConnection {
             return
         }
         do {
-            guard let handle = downloadHandle,
-                  let data = try handle.read(upToCount: min(262144, downloadRemaining)), !data.isEmpty,
-                  FileVersion(descriptor: handle.fileDescriptor) == downloadVersion else { close(); return }
+            let data: Data
+            if let zipReader {
+                data = try zipReader.read(upTo: min(262144, downloadRemaining))
+                guard !data.isEmpty else { close(); return }
+            } else {
+                guard let handle = downloadHandle,
+                      let chunk = try handle.read(upToCount: min(262144, downloadRemaining)), !chunk.isEmpty,
+                      FileVersion(descriptor: handle.fileDescriptor) == downloadVersion else { close(); return }
+                data = chunk
+            }
             downloadRemaining -= data.count
             let count = data.count
             touch()

@@ -73,6 +73,10 @@
  .action:focus-visible, .pick:focus-within, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
  .pick { position: relative; margin-top: 12px; padding-inline: 15px; background: var(--accent); color: var(--on-accent); border-color: transparent; }
  .pick:hover { background: var(--accent); }
+ .picks { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+ .picks .pick { margin-top: 0; }
+ .pick.secondary { background: transparent; color: var(--accent); border-color: var(--line); }
+ .pick.secondary:hover { background: var(--subtle); }
  .pick:has(input:disabled) { opacity: .55; cursor: default; }
  .pick input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: inherit; }
  .help { margin-top: 10px; }
@@ -97,6 +101,7 @@
 <body>
 <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
  <symbol id="document-icon" viewBox="0 0 24 24"><path d="M13.5 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8.5L13.5 3Z"/><path d="M13 3v6h6"/></symbol>
+ <symbol id="folder-icon" viewBox="0 0 24 24"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5H9l2 2.5h8.5A1.5 1.5 0 0 1 21 9v9.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5Z"/></symbol>
  <symbol id="download-icon" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 17v3h14v-3"/></symbol>
  <symbol id="upload-icon" viewBox="0 0 24 24"><path d="M12 16V4m-4 4 4-4 4 4M5 17v3h14v-3"/></symbol>
 </svg>
@@ -119,15 +124,22 @@
   <details id="downloadHelp" class="help" hidden>
    <summary>Download help</summary>
    <p>If a download stops, check your browser’s downloads for a retry or resume option.</p>
+   <p id="folderHelp" hidden>Folders download as .zip files. An interrupted folder download starts again from the beginning.</p>
   </details>
  </section>
  <section aria-labelledby="upload-heading">
   <h2 id="upload-heading">Send to the Mac</h2>
   <p id="uploadHint" class="message muted">Checking the receiving folder…</p>
-  <label class="action pick" id="pick" hidden>
-   <svg class="icon" aria-hidden="true"><use href="#upload-icon"/></svg>Choose files
-   <input type="file" id="upload" aria-label="Choose files to send to the Mac" multiple disabled>
-  </label>
+  <div class="picks" id="pick" hidden>
+   <label class="action pick">
+    <svg class="icon" aria-hidden="true"><use href="#upload-icon"/></svg>Choose files
+    <input type="file" id="upload" aria-label="Choose files to send to the Mac" multiple disabled>
+   </label>
+   <label class="action pick secondary" id="pickFolder" hidden>
+    <svg class="icon" aria-hidden="true"><use href="#folder-icon"/></svg>Choose folder
+    <input type="file" id="uploadFolder" aria-label="Choose a folder to send to the Mac" webkitdirectory disabled>
+   </label>
+  </div>
   <progress id="progress" max="100" value="0" hidden aria-label="Upload progress"></progress>
   <p id="upload-stats" class="muted transfer-stats" hidden></p>
   <p id="status" role="status" aria-live="polite"></p>
@@ -265,10 +277,11 @@ function showFileMessage(text, isError = false) {
 }
 
 function showFiles(files) {
- fileCount.textContent = files.length ? `${files.length} ${files.length === 1 ? 'file' : 'files'}` : '';
+ fileCount.textContent = files.length ? `${files.length} ${files.length === 1 ? 'item' : 'items'}` : '';
  downloadHelp.hidden = !files.length;
+ document.getElementById('folderHelp').hidden = !files.some(file => file.folder);
  if (!files.length) {
-  showFileMessage('No files shared from this Mac.');
+  showFileMessage('Nothing shared from this Mac.');
   return;
  }
  const rows = document.createDocumentFragment();
@@ -276,7 +289,10 @@ function showFiles(files) {
  for (const file of files) {
   const row = template.content.cloneNode(true);
   row.querySelector('.name').textContent = file.name;
-  row.querySelector('.size').textContent = formatSize(file.size);
+  row.querySelector('.size').textContent = file.folder
+   ? `Folder · ${file.items} ${file.items === 1 ? 'file' : 'files'} · ${formatSize(file.size)}`
+   : formatSize(file.size);
+  if (file.folder) row.querySelector('.file-icon use').setAttribute('href', '#folder-icon');
   const download = row.querySelector('a');
   download.href = base + '/files/' + encodeURIComponent(file.id);
   download.download = file.name;
@@ -293,6 +309,7 @@ function showSession(data) {
  uploadHint.hidden = data.canUpload;
  pick.hidden = !data.canUpload;
  uploadInput.disabled = !data.canUpload;
+ folderInput.disabled = !data.canUpload;
 }
 
 async function load() {
@@ -312,6 +329,9 @@ async function load() {
 retryFiles.addEventListener('click', load);
 window.addEventListener('online', () => { if (!retryFiles.hidden) load(); });
 const uploadInput = document.getElementById('upload');
+const folderInput = document.getElementById('uploadFolder');
+// Browsers without folder picking (most phones) keep only the files button.
+document.getElementById('pickFolder').hidden = !('webkitdirectory' in folderInput);
 const retryButton = document.getElementById('retry');
 const progressBar = document.getElementById('progress');
 const uploadStats = document.getElementById('upload-stats');
@@ -422,6 +442,7 @@ function checkedOffset(result, total) {
 
 async function uploadFile(job) {
  const {file, id} = job;
+ const label = (job.dir ? job.dir + '/' : '') + file.name + (job.count > 1 ? ` (${job.index} of ${job.count})` : '');
  let recover = job.started;
  let failures = 0;
  let offset = 0;
@@ -471,13 +492,13 @@ async function uploadFile(job) {
      if (state.savedAs && offset === file.size) return complete(state.savedAs);
     }
     reconnecting = false;
-    const sendingMessage = `Sending ${file.name}…`;
+    const sendingMessage = `Sending ${label}…`;
     status.textContent = sendingMessage;
     update(offset);
     job.started = true;
     firstRequest = false;
     const result = await uploadRequest(
-     {name: file.name, id, total: file.size, offset},
+     {name: file.name, id, total: file.size, offset, ...(job.dir ? {dir: job.dir, batch: job.batch} : {})},
      offset === 0 ? file : file.slice(offset),
      bytes => {
       if (status.textContent !== sendingMessage) status.textContent = sendingMessage;
@@ -493,7 +514,7 @@ async function uploadFile(job) {
     reset(offset);
     if (!error.retryable || failures >= 7) throw error;
     const delay = Math.min(1000 * 2 ** failures++, 12000);
-    status.textContent = `Reconnecting to finish ${file.name}…`;
+    status.textContent = `Reconnecting to finish ${label}…`;
     await new Promise(resolve => setTimeout(resolve, delay));
     recover = true;
    }
@@ -507,15 +528,22 @@ async function uploadBatch() {
  if (uploading || !pendingUploads.length) return;
  uploading = true;
  uploadInput.disabled = true;
+ folderInput.disabled = true;
  retryButton.hidden = true;
  progressBar.hidden = false;
  uploadStats.hidden = false;
  status.className = '';
  try {
+  let savedCount = 0;
+  let lastSaved = '';
   while (pendingUploads.length) {
-   const saved = await uploadFile(pendingUploads[0]);
+   lastSaved = await uploadFile(pendingUploads[0]);
    pendingUploads.shift();
-   status.textContent = `Saved on your Mac: ${saved}`;
+   savedCount++;
+   status.textContent = `Saved on your Mac: ${lastSaved}`;
+  }
+  if (savedCount > 1 && lastSaved.includes('/')) {
+   status.textContent = `Saved ${savedCount} files in ${lastSaved.split('/')[0]} on your Mac`;
   }
  } catch (error) {
   uploadStats.textContent = `${progressBar.value}%`;
@@ -525,21 +553,46 @@ async function uploadBatch() {
  } finally {
   uploading = false;
   uploadInput.disabled = false;
+  folderInput.disabled = false;
  }
 }
 
-uploadInput.addEventListener('change', event => {
- const selected = Array.from(event.target.files);
- if (!selected.length) return;
- if (selected.some(file => file.size > uploadLimit)) {
-  status.textContent = 'Choose files up to 20 GiB each.';
-  status.className = 'error';
-  uploadInput.value = '';
+function queueUploads(jobs, emptyMessage) {
+ if (!jobs.length) {
+  if (emptyMessage) {
+   status.textContent = emptyMessage;
+   status.className = 'error';
+  }
   return;
  }
- pendingUploads = selected.map(file => ({file, id: newTransferID(), started: false}));
- uploadInput.value = '';
+ if (jobs.some(job => job.file.size > uploadLimit)) {
+  status.textContent = 'Choose files up to 20 GiB each.';
+  status.className = 'error';
+  return;
+ }
+ pendingUploads = jobs.map((job, index) => ({...job, id: newTransferID(), started: false, index: index + 1, count: jobs.length}));
  uploadBatch();
+}
+
+uploadInput.addEventListener('change', () => {
+ const jobs = Array.from(uploadInput.files, file => ({file}));
+ uploadInput.value = '';
+ queueUploads(jobs);
+});
+
+folderInput.addEventListener('change', () => {
+ const batch = newTransferID();
+ const jobs = [];
+ for (const file of folderInput.files) {
+  const parts = (file.webkitRelativePath || file.name).split('/').filter(Boolean);
+  // Hidden files such as .DS_Store stay behind, like folders shared from the Mac.
+  if (parts.some(part => part.startsWith('.'))) continue;
+  const dir = parts.slice(0, -1).join('/');
+  jobs.push(dir ? {file, dir, batch} : {file});
+ }
+ const picked = folderInput.files.length;
+ folderInput.value = '';
+ if (picked) queueUploads(jobs, 'This folder has no files to send.');
 });
 retryButton.addEventListener('click', uploadBatch);
 const initialSession = document.getElementById('session-data');

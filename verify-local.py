@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """Check a running Relay session using generated files only.
 
-Usage: python3 verify-local.py SESSION_URL RECEIVING_FOLDER STREAMING_TEST_FILE
+Usage: python3 verify-local.py SESSION_URL RECEIVING_FOLDER STREAMING_TEST_FILE [SHARED_FOLDER]
 Start a session with a generated 32 MB file and a disposable receiving folder.
-Pass the absolute paths to the receiving folder and shared file.
+Pass the absolute paths to the receiving folder and shared file. To check
+folder sharing, also share a generated folder and pass its absolute path.
 """
 import hashlib
+import io
 import json
 import pathlib
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 base = sys.argv[1].rstrip("/")
 destination = pathlib.Path(sys.argv[2])
 source = pathlib.Path(sys.argv[3])
+shared_folder = pathlib.Path(sys.argv[4]) if len(sys.argv) > 4 else None
 parsed = urllib.parse.urlsplit(base)
 origin = f"{parsed.scheme}://{parsed.netloc}"
 client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def request(path, data=None, headers=None, method=None):
+def request(path, data=None, headers=None, method=None, timeout=20):
     req = urllib.request.Request(base + path, data=data, headers=headers or {}, method=method)
     try:
-        with client.open(req, timeout=20) as response:
+        with client.open(req, timeout=timeout) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()
@@ -58,6 +64,42 @@ code, _, chunk = request(file_route, headers={"Range": "bytes=-321"})
 passed(code == 206 and chunk == expected[-321:], "Suffix ranges return the correct bytes")
 passed(request(file_route, headers={"Range": "bytes=999999999999-"})[0] == 416, "Invalid ranges are rejected")
 passed(request("/files/not-shared")[0] == 404, "Unselected files cannot be downloaded")
+
+if shared_folder:
+    entry = next(file for file in manifest["files"] if file.get("folder") and file["name"] == shared_folder.name + ".zip")
+    folder_route = "/files/" + entry["id"]
+    code, headers, archive = request(folder_route)
+    passed(code == 200 and len(archive) == entry["size"] == int(headers["Content-Length"]), "A shared folder downloads at its advertised ZIP size")
+    passed(headers["Content-Type"] == "application/zip" and ".zip" in headers["Content-Disposition"], "Folder downloads are saved as .zip files")
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        passed(bundle.testzip() is None, "The folder ZIP passes CRC checks")
+        on_disk = {
+            str(path.relative_to(shared_folder.parent)): path.read_bytes()
+            for path in shared_folder.rglob("*")
+            if path.is_file() and not path.is_symlink()
+            and not any(part.startswith(".") for part in path.relative_to(shared_folder).parts)
+        }
+        in_zip = {info.filename: bundle.read(info) for info in bundle.infolist() if not info.is_dir()}
+        passed(in_zip == on_disk and entry["items"] == len(on_disk), "The folder ZIP holds every visible file with its exact bytes")
+    code, headers, body = request(folder_route, method="HEAD")
+    passed(code == 200 and not body and int(headers["Content-Length"]) == entry["size"], "HEAD reports the folder ZIP size")
+    # A fresh folder download scans its contents. Upload status checks must
+    # remain responsive even for a shared tree near the 200,000-item limit.
+    scanning = threading.Event()
+
+    def scan_folder():
+        scanning.set()
+        return request(folder_route, method="HEAD", timeout=120)
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        folder_scan = worker.submit(scan_folder)
+        scanning.wait()
+        time.sleep(0.1)
+        probe_id = str(uuid.uuid4())
+        code, _, _ = request(f"/upload?id={probe_id}", headers={"X-Relay-Upload": "1"}, timeout=3)
+        passed(code == 200 and folder_scan.result()[0] == 200, "Upload status remains responsive during a folder scan")
+    code, _, whole = request(folder_route, headers={"Range": "bytes=100-"})
+    passed(code == 200 and whole == archive, "Folder downloads ignore ranges and resend the whole ZIP")
 bad_base = base.replace(parsed.path, "/s/not-a-valid-session")
 try:
     client.open(bad_base + "/api", timeout=5)
@@ -80,6 +122,30 @@ passed(request(route, data=b"no", headers={"Origin": origin})[0] == 403, "Upload
 passed(request("/upload?name=..%2Foutside.txt", data=b"no", headers=upload_headers)[0] == 400, "Upload path traversal is rejected")
 passed(request("/upload?name=.hidden", data=b"no", headers=upload_headers)[0] == 400, "Hidden upload filenames are rejected")
 passed(request(route, data=b"", headers=upload_headers)[0] == 200, "Empty files can be uploaded")
+
+
+def folder_upload(directory, name, data, batch):
+    query = urllib.parse.urlencode({"name": name, "dir": directory, "batch": batch}, quote_via=urllib.parse.quote)
+    return request("/upload?" + query, data=data, headers=upload_headers)
+
+
+folder_name = f"Folder upload ✓ {uuid.uuid4().hex[:8]}"
+first_batch = str(uuid.uuid4())
+code, _, result = folder_upload(f"{folder_name}/nested/deeper", "photo.bin", b"first", first_batch)
+saved = json.loads(result)["savedAs"]
+passed(code == 200 and saved == f"{folder_name}/nested/deeper/photo.bin" and (destination / saved).read_bytes() == b"first",
+       "Folder uploads recreate their subfolders in the chosen folder")
+code, _, result = folder_upload(folder_name, "top.txt", b"top", first_batch)
+passed(code == 200 and json.loads(result)["savedAs"] == f"{folder_name}/top.txt", "Files from one folder upload stay together")
+code, _, result = folder_upload(f"{folder_name}/nested", "photo.bin", b"second", str(uuid.uuid4()))
+second = json.loads(result)["savedAs"]
+passed(code == 200 and second == f"{folder_name} (1)/nested/photo.bin" and (destination / saved).read_bytes() == b"first",
+       "A second upload of the same folder gets its own folder")
+for bad in ["../outside", "a/../../outside", "a//b", ".hidden", "a/.git", "/absolute", "a\\b"]:
+    passed(folder_upload(bad, "x.txt", b"no", str(uuid.uuid4()))[0] == 400, f"Unsafe folder path {bad!r} is rejected")
+passed(request("/upload?" + urllib.parse.urlencode({"name": "x.txt", "dir": "NoBatch"}), data=b"no", headers=upload_headers)[0] == 400,
+       "Folder uploads require a batch ID")
+passed(not (destination.parent / "outside").exists() and not (destination / "NoBatch").exists(), "Rejected folder uploads create nothing")
 
 before = set(destination.glob(".relay-*.part"))
 with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as connection:
