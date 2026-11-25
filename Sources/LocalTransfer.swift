@@ -240,22 +240,19 @@ final class LocalTransferModel: ObservableObject {
 }
 
 // A session-scoped HTTP server, bound to the Mac's Wi-Fi address only.
-// All connection state and file I/O run on one serial queue.
+// Connection state and streaming I/O run on one serial queue. Folder scans
+// use a separate queue so directory enumeration cannot stall active transfers.
 final class LocalHTTPServer {
     let queue = DispatchQueue(label: "local.relay.http")
+    private let folderScanQueue = DispatchQueue(label: "local.relay.folder-scans", qos: .utility)
     let prefix = "/s/" + UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")
     let files: [String: URL]
     let folders: Set<String>
     fileprivate let versions: [String: FileVersion]
     let receiveFolder: URL?
     private let page: Data
-    private lazy var initialPage: Data = {
-        guard let html = String(data: page, encoding: .utf8),
-              let data = try? manifest() else { return page }
-        let json = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "<", with: "\\u003c")
-        let script = "<script id=\"session-data\" type=\"application/json\">\(json)</script>"
-        return Data(html.replacingOccurrences(of: "<!-- relay:session-data -->", with: script).utf8)
-    }()
+    private var folderMetadata: [String: (size: Int, count: Int)] = [:]
+    private var folderScans: [String: [(Result<FolderArchive, Error>) -> Void]] = [:]
     var onReady: ((URL, URL) -> Void)?
     var onActivity: ((TransferActivity) -> Void)?
     var onProgress: (([TransferProgress]) -> Void)?
@@ -391,6 +388,7 @@ final class LocalHTTPServer {
             progressTimer?.cancel()
             progressTimer = nil
             closeNetwork()
+            folderScans.removeAll()
             for upload in uploads.values { upload.removeTemporaryFile() }
             uploads.removeAll()
         }
@@ -495,19 +493,58 @@ final class LocalHTTPServer {
         }
     }
 
+    // Listing requests share the initial scan and then reuse its summary.
+    // A download always requests a fresh scan and refreshes that summary.
+    fileprivate func prepareManifest(_ completion: @escaping () -> Void) {
+        let pending = folders.filter { folderMetadata[$0] == nil }
+        guard !pending.isEmpty else { completion(); return }
+        var remaining = pending.count
+        for key in pending {
+            scanFolder(key) { _ in
+                remaining -= 1
+                if remaining == 0 { completion() }
+            }
+        }
+    }
+
+    fileprivate func scanFolder(_ key: String, completion: @escaping (Result<FolderArchive, Error>) -> Void) {
+        if folderScans[key] != nil {
+            folderScans[key]?.append(completion)
+            return
+        }
+        guard let folder = files[key] else { return }
+        folderScans[key] = [completion]
+        folderScanQueue.async { [weak self] in
+            let result = Result { try FolderArchive(folder: folder) }
+            let metadata = result.map { (size: $0.length, count: $0.fileCount) }
+            self?.queue.async { [weak self] in
+                guard let self, !self.stopped else { return }
+                self.folderMetadata[key] = (try? metadata.get()) ?? (size: 0, count: 0)
+                let callbacks = self.folderScans.removeValue(forKey: key) ?? []
+                for callback in callbacks { callback(result) }
+            }
+        }
+    }
+
     func manifest() throws -> Data {
         let items: [[String: Any]] = files.sorted { $0.value.lastPathComponent < $1.value.lastPathComponent }.map { key, url in
             guard folders.contains(key) else {
                 return ["id": key, "name": url.lastPathComponent, "size": versions[key]?.size ?? 0]
             }
-            let archive = try? FolderArchive(folder: url)
-            return ["id": key, "name": url.lastPathComponent + ".zip", "size": archive?.length ?? 0,
-                    "folder": true, "items": archive?.fileCount ?? 0]
+            let metadata = folderMetadata[key]
+            return ["id": key, "name": url.lastPathComponent + ".zip", "size": metadata?.size ?? 0,
+                    "folder": true, "items": metadata?.count ?? 0]
         }
         return try JSONSerialization.data(withJSONObject: ["files": items, "canUpload": receiveFolder != nil])
     }
 
-    func sessionPage() -> Data { initialPage }
+    func sessionPage() -> Data {
+        guard let html = String(data: page, encoding: .utf8),
+              let data = try? manifest() else { return page }
+        let json = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "<", with: "\\u003c")
+        let script = "<script id=\"session-data\" type=\"application/json\">\(json)</script>"
+        return Data(html.replacingOccurrences(of: "<!-- relay:session-data -->", with: script).utf8)
+    }
 }
 
 struct FileVersion: Equatable {
@@ -684,10 +721,20 @@ private final class HTTPConnection {
         guard let host = headers["host"], server.acceptsHost(host) else { reply(403, "Unexpected host"); return }
         guard headers["transfer-encoding"] == nil else { reply(400, "Chunked requests are not supported"); return }
         if method == "GET", path == server.prefix + "/" {
-            reply(200, data: server.sessionPage(), type: "text/html; charset=utf-8")
+            responding = true
+            server.prepareManifest { [weak self] in
+                guard let self, !self.finished else { return }
+                self.responding = false
+                self.reply(200, data: self.server.sessionPage(), type: "text/html; charset=utf-8")
+            }
         } else if method == "GET", path == server.prefix + "/api" {
-            do { reply(200, data: try server.manifest(), type: "application/json") }
-            catch { reply(500, "Could not list files") }
+            responding = true
+            server.prepareManifest { [weak self] in
+                guard let self, !self.finished else { return }
+                self.responding = false
+                do { self.reply(200, data: try self.server.manifest(), type: "application/json") }
+                catch { self.reply(500, "Could not list files") }
+            }
         } else if method == "GET", path == server.prefix + "/download-progress" {
             guard let rawID = components.queryItems?.first(where: { $0.name == "id" })?.value,
                   let browserID = UUID(uuidString: rawID) else { reply(400, "Invalid download ID"); return }
@@ -702,7 +749,7 @@ private final class HTTPConnection {
             guard let file = server.files[key] else { reply(404, "File not found"); return }
             let browserID = components.queryItems?.first(where: { $0.name == "progress" })?.value.flatMap { UUID(uuidString: $0) }
             if server.folders.contains(key) {
-                downloadFolder(file, headOnly: method == "HEAD", browserID: browserID)
+                downloadFolder(key, url: file, headOnly: method == "HEAD", browserID: browserID)
                 return
             }
             guard let version = server.versions[key] else { reply(404, "This file is no longer readable on the Mac"); return }
@@ -975,9 +1022,18 @@ private final class HTTPConnection {
     // Folders stream as a freshly scanned ZIP. Range requests are ignored and
     // answered with the whole archive, because resuming mid-archive would need
     // the CRCs of every earlier file.
-    private func downloadFolder(_ url: URL, headOnly: Bool, browserID: UUID?) {
+    private func downloadFolder(_ key: String, url: URL, headOnly: Bool, browserID: UUID?) {
+        responding = true
+        server.scanFolder(key) { [weak self] result in
+            guard let self, !self.finished else { return }
+            self.responding = false
+            self.sendFolder(result, url: url, headOnly: headOnly, browserID: browserID)
+        }
+    }
+
+    private func sendFolder(_ result: Result<FolderArchive, Error>, url: URL, headOnly: Bool, browserID: UUID?) {
         let archive: FolderArchive
-        do { archive = try FolderArchive(folder: url) } catch {
+        do { archive = try result.get() } catch {
             if !headOnly, let browserID {
                 let meter = TransferMeter(name: url.lastPathComponent + ".zip", sending: true, total: 0, browserID: browserID)
                 meter.finish(.interrupted)

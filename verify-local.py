@@ -12,12 +12,14 @@ import json
 import pathlib
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 base = sys.argv[1].rstrip("/")
 destination = pathlib.Path(sys.argv[2])
@@ -28,10 +30,10 @@ origin = f"{parsed.scheme}://{parsed.netloc}"
 client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def request(path, data=None, headers=None, method=None):
+def request(path, data=None, headers=None, method=None, timeout=20):
     req = urllib.request.Request(base + path, data=data, headers=headers or {}, method=method)
     try:
-        with client.open(req, timeout=20) as response:
+        with client.open(req, timeout=timeout) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()
@@ -81,6 +83,21 @@ if shared_folder:
         passed(in_zip == on_disk and entry["items"] == len(on_disk), "The folder ZIP holds every visible file with its exact bytes")
     code, headers, body = request(folder_route, method="HEAD")
     passed(code == 200 and not body and int(headers["Content-Length"]) == entry["size"], "HEAD reports the folder ZIP size")
+    # A fresh folder download scans its contents. Upload status checks must
+    # remain responsive even for a shared tree near the 200,000-item limit.
+    scanning = threading.Event()
+
+    def scan_folder():
+        scanning.set()
+        return request(folder_route, method="HEAD", timeout=120)
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        folder_scan = worker.submit(scan_folder)
+        scanning.wait()
+        time.sleep(0.1)
+        probe_id = str(uuid.uuid4())
+        code, _, _ = request(f"/upload?id={probe_id}", headers={"X-Relay-Upload": "1"}, timeout=3)
+        passed(code == 200 and folder_scan.result()[0] == 200, "Upload status remains responsive during a folder scan")
     code, _, whole = request(folder_route, headers={"Range": "bytes=100-"})
     passed(code == 200 and whole == archive, "Folder downloads ignore ranges and resend the whole ZIP")
 bad_base = base.replace(parsed.path, "/s/not-a-valid-session")
